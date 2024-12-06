@@ -1,202 +1,30 @@
-// Package sqlrange integrates database/sql with Go 1.23 range functions.
 package sqlrange
 
 import (
 	"context"
-	"database/sql"
-	"fmt"
 	"iter"
 	"reflect"
 	"slices"
 	"sync/atomic"
+
+	"errors"
+	"github.com/jackc/pgx/v5"
 )
-
-// ExecOption is a functional option type to configure the [Exec] and [ExecContext]
-// functions.
-type ExecOption[Row any] func(*execOptions[Row])
-
-// ExecArgsFields constructs an option that specifies the fields to include in
-// the query arguments from a list of column names.
-//
-// This option is useful when the query only needs a subset of the fields from
-// the row type, or when the query arguments are in a different order than the
-// struct fields.
-func ExecArgsFields[Row any](columnNames ...string) ExecOption[Row] {
-	structFieldIndexes := make([][]int, len(columnNames))
-
-	for columnName, structField := range Fields(reflect.TypeOf(new(Row)).Elem()) {
-		if columnIndex := slices.Index(columnNames, columnName); columnIndex >= 0 {
-			structFieldIndexes[columnIndex] = structField.Index
-		}
-	}
-
-	for i, structFieldIndex := range structFieldIndexes {
-		if structFieldIndex == nil {
-			panic(fmt.Errorf("column %q not found", columnNames[i]))
-		}
-	}
-
-	return ExecArgs(func(args []any, row Row) []any {
-		rowValue := reflect.ValueOf(row)
-		for _, structFieldIndex := range structFieldIndexes {
-			args = append(args, rowValue.FieldByIndex(structFieldIndex).Interface())
-		}
-		return args
-	})
-}
-
-// ExecArgs is an option that specifies the function being called to generate
-// the list of arguments passed when executing a query.
-//
-// By default, the Row value is converted to a list of arguments by taking the
-// fields with a "sql" struct tag in the order they appear in the struct,
-// as defined by the [reflect.VisibleFields] function.
-//
-// The function must append the arguments to the slice passed as argument and
-// return the resulting slice.
-func ExecArgs[Row any](fn func([]any, Row) []any) ExecOption[Row] {
-	return func(opts *execOptions[Row]) { opts.args = fn }
-}
-
-// ExecQuery is an option that specifies the function being called to generate
-// the query to execute for a given Row value.
-//
-// The function receives the original query value passed to [Exec] or [ExecContext],
-// and returns the query to execute.
-//
-// This is useful when parts of the query depend on the Row value that the query
-// is being executed on, for example when the query is an insert.
-func ExecQuery[Row any](fn func(string, Row) string) ExecOption[Row] {
-	return func(opts *execOptions[Row]) { opts.query = fn }
-}
-
-type execOptions[Row any] struct {
-	args  func([]any, Row) []any
-	query func(string, Row) string
-}
-
-// Executable is the interface implemented by [sql.DB], [sql.Conn], or [sql.Tx].
-type Executable interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-}
-
-// Exec is like [ExecContext] but it uses the background context.
-func Exec[Row any](e Executable, query string, seq iter.Seq2[Row, error], opts ...ExecOption[Row]) iter.Seq2[sql.Result, error] {
-	return ExecContext[Row](context.Background(), e, query, seq, opts...)
-}
-
-// ExecContext executes a query for each row in the sequence.
-//
-// To ensure that the query is executed atomically, it is usually useful to
-// call ExecContext on a transaction ([sql.Tx]), for example:
-//
-//	tx, err := db.BeginTx(ctx, nil)
-//	if err != nil {
-//	  ...
-//	}
-//	defer tx.Rollback()
-//	for r, err := range sqlrange.ExecContext[RowType](ctx, tx, query, rows) {
-//	  if err != nil {
-//	    ...
-//	  }
-//	  ...
-//	}
-//	if err := tx.Commit(); err != nil {
-//	  ...
-//	}
-//
-// Since the function makes one query execution for each row read from the
-// sequence, latency of the query execution can quickly increase. In some cases,
-// such as inserting values in a database, the program can amortize the cost of
-// query latency by batching the rows being inserted, for example:
-//
-//	for r, err := range sqlrange.ExecContext(ctx, tx,
-//		`insert into table (col1, col2, col3) values `,
-//		// yield groups of rows to be inserted in bulk
-//		func(yield func([]RowType, error) bool) {
-//		  ...
-//		},
-//		// append values for the insert query
-//		sqlrange.ExecArgs(func(args []any, rows []RowType) []any {
-//		  for _, row := range rows {
-//		    args = append(args, row.Col1, row.Col2, row.Col3)
-//		  }
-//		  return args
-//		}),
-//		// generate placeholders for the insert query
-//		sqlrange.ExecQuery(func(query string, rows []RowType) string {
-//		  return query + strings.Repeat(`(?, ?, ?)`, len(rows))
-//		}),
-//	) {
-//		...
-//	}
-//
-// Batching operations this way is necessary to achieve high throughput when
-// inserting values into a database.
-func ExecContext[Row any](ctx context.Context, e Executable, query string, seq iter.Seq2[Row, error], opts ...ExecOption[Row]) iter.Seq2[sql.Result, error] {
-	return func(yield func(sql.Result, error) bool) {
-		options := new(execOptions[Row])
-		for _, opt := range opts {
-			opt(options)
-		}
-
-		if options.args == nil {
-			row := new(Row)
-			val := reflect.ValueOf(row).Elem()
-			fields := Fields(val.Type())
-			options.args = func(args []any, in Row) []any {
-				*row = in
-				for _, structField := range fields {
-					args = append(args, val.FieldByIndex(structField.Index).Interface())
-				}
-				return args
-			}
-		}
-
-		if options.query == nil {
-			options.query = func(query string, _ Row) string { return query }
-		}
-
-		var execArgs []any
-		var execQuery string
-		for r, err := range seq {
-			if err != nil {
-				yield(nil, err)
-				return
-			}
-			execArgs = options.args(execArgs[:0], r)
-			execQuery = options.query(query, r)
-
-			res, err := e.ExecContext(ctx, execQuery, execArgs...)
-			if !yield(res, err) {
-				return
-			}
-			if err != nil {
-				return
-			}
-		}
-	}
-}
 
 // Queryable is an interface implemented by types that can send SQL queries,
 // such as [sql.DB], [sql.Conn], or [sql.Tx].
 type Queryable interface {
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	Query(ctx context.Context, query string, args ...any) (pgx.Rows, error)
 }
 
-// Query is like [QueryContext] but it uses the background context.
-func Query[Row any](q Queryable, query string, args ...any) iter.Seq2[Row, error] {
-	return QueryContext[Row](context.Background(), q, query, args...)
-}
-
-// QueryContext returns the results of the query as a sequence of rows.
+// Query returns the results of the query as a sequence of rows.
 //
 // The returned function automatically closes the underlying [sql.Rows] value when
 // it completes its iteration.
 //
-// A typical use of QueryContext is:
+// A typical use of Query is:
 //
-//	for row, err := range sqlrange.QueryContext[RowType](ctx, db, query, args...) {
+//	for row, err := range sqlrange.Query[RowType](ctx, db, query, args...) {
 //	  if err != nil {
 //	    ...
 //	  }
@@ -208,9 +36,9 @@ func Query[Row any](q Queryable, query string, args ...any) iter.Seq2[Row, error
 //
 // See [Scan] for more information about how the rows are mapped to the row type
 // parameter Row.
-func QueryContext[Row any](ctx context.Context, q Queryable, query string, args ...any) iter.Seq2[Row, error] {
+func Query[Row any](ctx context.Context, q Queryable, query string, args ...any) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) {
-		if rows, err := q.QueryContext(ctx, query, args...); err != nil {
+		if rows, err := q.Query(ctx, query, args...); err != nil {
 			var zero Row
 			yield(zero, err)
 		} else {
@@ -226,7 +54,7 @@ func QueryContext[Row any](ctx context.Context, q Queryable, query string, args 
 //
 // A typical use of Scan is:
 //
-//	rows, err := db.QueryContext(ctx, query, args...)
+//	rows, err := db.Query(ctx, query, args...)
 //	if err != nil {
 //	  ...
 //	}
@@ -251,18 +79,23 @@ func QueryContext[Row any](ctx context.Context, q Queryable, query string, args 
 //
 // Ranging over the returned function will panic if the type parameter is not a
 // struct.
-func Scan[Row any](rows *sql.Rows) iter.Seq2[Row, error] {
+func Scan[Row any](rows pgx.Rows) iter.Seq2[Row, error] {
 	return func(yield func(Row, error) bool) { scan(yield, rows) }
 }
 
-func scan[Row any](yield func(Row, error) bool, rows *sql.Rows) {
+func scan[Row any](yield func(Row, error) bool, rows pgx.Rows) {
 	defer rows.Close()
 	var zero Row
 
-	columns, err := rows.Columns()
-	if err != nil {
-		yield(zero, err)
+	fieldDescs := rows.FieldDescriptions()
+	if fieldDescs == nil {
+		yield(zero, errors.New("missing rows.FieldDescriptions()"))
 		return
+	}
+
+	columns := make([]string, 0, len(fieldDescs))
+	for _, fd := range fieldDescs {
+		columns = append(columns, fd.Name)
 	}
 
 	scanArgs := make([]any, len(columns))
